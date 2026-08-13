@@ -15,8 +15,9 @@ al., arXiv:2411.15594v6) — the PDF is in the repo root
 No agent framework or orchestration library is used. The refine/judge
 loop, the majority-vote gate, and the output parsing are all plain,
 hand-written Python in `llm_as_a_judge.py`. The only third-party
-dependency is the official `anthropic` SDK, used only to make individual
-API calls.
+dependency is the official `groq` SDK, used only to make individual API
+calls. Groq hosts fast inference for several open models (Llama,
+GPT-OSS, Kimi K2, etc.) — this script defaults to `openai/gpt-oss-120b`.
 
 ## How the loop works
 
@@ -92,13 +93,13 @@ Two more details borrowed from the paper:
 cd llm_judge
 python3 -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install anthropic
+pip install groq
 ```
 
-Set your Anthropic API key (get one at https://console.anthropic.com/):
+Set your Groq API key (get one at https://console.groq.com/keys):
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export GROQ_API_KEY=gsk_...
 ```
 
 ## Running it
@@ -117,8 +118,8 @@ python llm_as_a_judge.py --n-judge-samples 5
 # Allow more/fewer refinement rounds before giving up (default 5)
 python llm_as_a_judge.py --max-rounds 8
 
-# Use a different model
-python llm_as_a_judge.py --model claude-sonnet-5
+# Use a different Groq-hosted model
+python llm_as_a_judge.py --model llama-3.3-70b-versatile
 ```
 
 ### What the output looks like
@@ -180,10 +181,18 @@ the code), each testing a different kind of jargon:
 - **The loop always terminates.** If the judge never approves, the loop
   stops after `--max-rounds` and returns the best attempt so far, clearly
   labeled as not approved rather than silently pretending success.
-- **No `temperature` knob.** Claude Opus 5 doesn't accept
-  `temperature`/`top_p` (removed in this model generation), so the
-  "ask several times" step relies on the model's own natural variation
-  across calls.
+- **JSON mode on the judge call.** The Groq API accepts a
+  `response_format={"type": "json_object"}` parameter that constrains the
+  model's output to valid JSON — this is used on the judge call as an
+  extra layer on top of the prompt instruction, and is the same
+  "standardize the output format" idea the paper describes (Section
+  3.1.2). The rewriter call doesn't use it since it's meant to return
+  plain prose, not JSON.
+- **Model choice affects reliability.** `openai/gpt-oss-120b` is used by
+  default for its strong instruction-following, which matters both for
+  producing faithful rewrites and for the judge reliably returning valid
+  JSON. Smaller Groq models may need more of the fallback parsing paths
+  in `parse_judge_output()` to kick in.
 
 ## File layout
 

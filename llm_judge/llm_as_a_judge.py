@@ -66,8 +66,9 @@ decision trustworthy rather than a coin flip:
 
 Everything above -- the refine/judge loop, the majority-vote gate, the
 parsing -- is plain, hand-written Python in this file. The only external
-library used is the official `anthropic` SDK, and it is used only to make
-individual API calls; no agent framework or orchestration library is
+library used is the official `groq` SDK (Groq hosts open models like
+Llama and GPT-OSS behind a fast inference API), and it is used only to
+make individual API calls; no agent framework or orchestration library is
 involved anywhere.
 """
 
@@ -82,14 +83,16 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 
-import anthropic
+import groq
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 # The model used for both roles (rewriter and judge). Override with --model.
-DEFAULT_MODEL = "claude-opus-5"
+# Groq hosts several open models; gpt-oss-120b is a strong general default
+# for instruction-following / structured JSON output like this script needs.
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 # How many independent times to ask the judge about the SAME draft, each
 # round. The draft only advances if a strict majority say it's ready.
@@ -210,18 +213,20 @@ class Rewriter:
     one model call -- all of the looping and decision-making about whether
     to call this again lives in `refine_until_approved` below."""
 
-    def __init__(self, client: anthropic.Anthropic, model: str = DEFAULT_MODEL):
+    def __init__(self, client: groq.Groq, model: str = DEFAULT_MODEL):
         self._client = client
         self._model = model
 
     def _call(self, user: str) -> str:
-        response = self._client.messages.create(
+        response = self._client.chat.completions.create(
             model=self._model,
-            max_tokens=1024,
-            system=REWRITER_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user}],
+            max_completion_tokens=1024,
+            messages=[
+                {"role": "system", "content": REWRITER_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
         )
-        return "".join(block.text for block in response.content if block.type == "text").strip()
+        return (response.choices[0].message.content or "").strip()
 
     def write_first_draft(self, original_text: str) -> str:
         return self._call(REWRITER_INITIAL_TEMPLATE.format(original_text=original_text))
@@ -239,19 +244,26 @@ class Judge:
     several of these raw calls into one trustworthy decision lives in
     `judge_round` below, not in this class."""
 
-    def __init__(self, client: anthropic.Anthropic, model: str = DEFAULT_MODEL):
+    def __init__(self, client: groq.Groq, model: str = DEFAULT_MODEL):
         self._client = client
         self._model = model
 
     def call(self, original_text: str, draft_text: str) -> str:
         user = JUDGE_USER_TEMPLATE.format(original_text=original_text, draft_text=draft_text)
-        response = self._client.messages.create(
+        response = self._client.chat.completions.create(
             model=self._model,
-            max_tokens=512,
-            system=JUDGE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user}],
+            max_completion_tokens=512,
+            # Ask Groq to constrain the reply to valid JSON. This is the same
+            # "standardize the output format" reliability technique the
+            # paper describes (Section 3.1.2) -- the parser below still
+            # keeps its fallback strategies in case a model doesn't honor it.
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
         )
-        return "".join(block.text for block in response.content if block.type == "text")
+        return response.choices[0].message.content or ""
 
 
 # ---------------------------------------------------------------------------
@@ -500,16 +512,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         print(
-            "ERROR: ANTHROPIC_API_KEY is not set. Export your Anthropic API key, e.g.\n"
-            "    export ANTHROPIC_API_KEY=sk-ant-...\n",
+            "ERROR: GROQ_API_KEY is not set. Export your Groq API key, e.g.\n"
+            "    export GROQ_API_KEY=gsk_...\n"
+            "Get one at https://console.groq.com/keys\n",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = groq.Groq(api_key=api_key)
     rewriter = Rewriter(client, model=args.model)
     judge = Judge(client, model=args.model)
 
