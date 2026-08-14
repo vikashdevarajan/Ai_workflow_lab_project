@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM as a Judge</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>LLM as a Judge</h1>
+            <p>Simplifying complex insurance policies into plain English using iterative AI refinements.</p>
+        </header>
+
+        <main>
+            <section class="input-section glass-panel">
+                <label for="policy-text">Original Policy Text</label>
+                <textarea id="policy-text" rows="6" placeholder="Enter dense insurance policy paragraph here..."></textarea>
+                <button id="submit-btn" class="glow-on-hover">Simplify Text</button>
+            </section>
+
+            <section class="progress-section" id="progress-container" style="display: none;">
+                <h2>Refinement Progress</h2>
+                <div class="status-badge" id="current-status">Initializing...</div>
+                
+                <div id="rounds-container">
+                    <!-- Dynamic round cards will be inserted here -->
+                </div>
+
+                <div class="final-result glass-panel" id="final-result" style="display: none;">
+                    <h3>Final Simplified Text</h3>
+                    <div id="final-text" class="text-content"></div>
+                    <div class="badge" id="final-badge"></div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>

@@ -315,7 +315,7 @@ def parse_judge_output(raw: str) -> tuple[bool | None, bool | None, str | None]:
 # ---------------------------------------------------------------------------
 
 
-def judge_round(judge: Judge, original_text: str, draft_text: str, round_number: int, n_samples: int, verbose: bool) -> RoundResult:
+def judge_round(judge: Judge, original_text: str, draft_text: str, round_number: int, n_samples: int, verbose: bool, callback=None) -> RoundResult:
     """
     Judge one draft with a majority vote instead of trusting a single call.
 
@@ -346,6 +346,16 @@ def judge_round(judge: Judge, original_text: str, draft_text: str, round_number:
         if verbose:
             print(f"    [judge #{sample_index + 1}] clear={clear} faithful={faithful}  ({feedback!r})")
 
+        if callback:
+            callback({
+                "type": "judge_vote",
+                "round_number": round_number,
+                "sample_index": sample_index + 1,
+                "clear": clear,
+                "faithful": faithful,
+                "feedback": feedback
+            })
+
         # Keep the most recent piece of critical feedback in reserve, in
         # case the round as a whole is not approved.
         if feedback and (clear is False or faithful is False):
@@ -359,6 +369,16 @@ def judge_round(judge: Judge, original_text: str, draft_text: str, round_number:
         # Every vote failed to parse, or approved votes gave no feedback text.
         result.combined_feedback = "The rewrite is still too complex or may have altered the original meaning -- simplify further while keeping every condition intact."
 
+    if callback:
+        callback({
+            "type": "round_result",
+            "round_number": round_number,
+            "approved": result.approved,
+            "clear_votes": result.clear_votes,
+            "faithful_votes": result.faithful_votes,
+            "combined_feedback": result.combined_feedback
+        })
+
     return result
 
 
@@ -369,6 +389,7 @@ def refine_until_approved(
     max_rounds: int = MAX_ROUNDS,
     n_judge_samples: int = N_JUDGE_SAMPLES,
     verbose: bool = True,
+    callback=None,
 ) -> RefinementRun:
     """
     The main agentic loop: write a draft, judge it, and if it's not
@@ -389,6 +410,8 @@ def refine_until_approved(
     """
     run = RefinementRun(original_text=original_text)
 
+    if callback:
+        callback({"type": "status", "message": "Drafting initial version..."})
     draft = rewriter.write_first_draft(original_text)
 
     for round_number in range(1, max_rounds + 1):
@@ -396,7 +419,11 @@ def refine_until_approved(
             print(f"\n--- Round {round_number}/{max_rounds} ---")
             print(f"  draft: {draft}")
 
-        result = judge_round(judge, original_text, draft, round_number, n_judge_samples, verbose)
+        if callback:
+            callback({"type": "draft", "round_number": round_number, "text": draft})
+            callback({"type": "status", "message": f"Judging round {round_number}..."})
+
+        result = judge_round(judge, original_text, draft, round_number, n_judge_samples, verbose, callback)
         run.rounds.append(result)
 
         if verbose:
@@ -409,17 +436,23 @@ def refine_until_approved(
         if result.approved:
             run.final_text = draft
             run.approved = True
+            if callback:
+                callback({"type": "final", "approved": True, "text": draft})
             return run
 
         if round_number < max_rounds:
             if verbose:
                 print(f"  feedback for next round: {result.combined_feedback}")
+            if callback:
+                callback({"type": "status", "message": f"Drafting revision {round_number+1} based on feedback..."})
             draft = rewriter.revise(original_text, draft, result.combined_feedback)
 
     # Ran out of rounds without approval -- return the last draft produced,
     # clearly marked as not approved rather than silently pretending success.
     run.final_text = draft
     run.approved = False
+    if callback:
+        callback({"type": "final", "approved": False, "text": draft})
     return run
 
 
