@@ -1,86 +1,11 @@
-"""
-LLM-as-a-Judge, applied to simplifying insurance policy text
-================================================================
-
-This script uses one LLM to *rewrite* dense insurance policy text into
-plain language, and a second LLM role -- the judge -- to decide whether
-each rewrite is actually good enough yet. If the judge says no, the draft
-gets rewritten again using the judge's feedback, and the cycle repeats
-until the judge approves or a maximum number of rounds is reached.
-
-The idea comes from the paper "A Survey on LLM-as-a-Judge" (Gu, Jiang,
-Shi, et al., arXiv:2411.15594v6) -- the PDF is in the repo root as
-`2411.15594v6.pdf`.
-
-The applied task, in plain terms
------------------------------------
-You give the program one paragraph of real insurance-policy legalese. It
-then runs a loop:
-
-    draft  ->  judge checks it  ->  not good enough?  ->  rewrite  ->  repeat
-
-On each round, the judge looks at the *original* legal paragraph and the
-*current* simplified draft, and answers two yes/no questions:
-
-  1. Is this understandable to a layman with no insurance or legal
-     background?
-  2. Does it still mean the same thing as the original -- did the rewrite
-     accidentally drop or distort an important condition, exclusion, or
-     number?
-
-If both are "yes", the loop stops and that draft is the final answer. If
-either is "no", the judge also writes one sentence explaining what's still
-wrong, and that feedback is fed straight into the next rewrite attempt.
-
-This is a real use of the "LLM-as-a-Judge" pattern where the judge isn't
-just picking a winner between two fixed options -- it's acting as the
-*stopping condition* for an iterative loop. The paper itself calls out
-exactly this style of use: a Yes/No judgment used as a feedback signal
-that decides whether another iteration is needed (Section 2.1.2, citing
-Reflexion's "Modification needed." / "No modification needed." pattern).
-
-The two reliability ideas borrowed from the paper
------------------------------------------------------
-A single raw judge call is a bit noisy and easy to fool, so two ideas from
-the paper's reliability discussion are used to make the stop/continue
-decision trustworthy rather than a coin flip:
-
-1. **Ask the judge more than once per round and require agreement.**
-   The paper recommends running several independent judgments on the same
-   thing and combining them rather than trusting one call (Section 3.3.1,
-   "perform multiple runs of evaluation ... and summarize these
-   results"). Here, each round asks the judge N times independently; the
-   draft only advances to "approved" if a strict majority of those calls
-   say yes on *both* clarity and faithfulness. This stops one lucky or
-   unlucky judge call from ending the loop too early or too late.
-
-2. **Force the judge to answer in structured JSON, not free text.**
-   The paper calls this out directly as a reliability technique (Section
-   3.1.2, "Standardizing LLMs' Output Format"). It's much easier to
-   reliably extract a yes/no answer plus feedback text from
-   `{"clear": true, "faithful": true, "feedback": "..."}` than from a
-   sentence buried in prose. Because real models sometimes still wrap
-   JSON in extra text anyway, the parser below has a few fallback
-   strategies before it gives up (Section 2.3.1, "Extracting specific
-   tokens").
-
-Everything above -- the refine/judge loop, the majority-vote gate, the
-parsing -- is plain, hand-written Python in this file. The only external
-library used is the official `groq` SDK (Groq hosts open models like
-Llama and GPT-OSS behind a fast inference API), and it is used only to
-make individual API calls; no agent framework or orchestration library is
-involved anywhere.
+"""LLM-as-a-Judge: rewrites dense insurance-policy text into plain language,
+using a second LLM as a judge that must approve it before the loop stops.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import re
-import sys
-import time
-from collections import Counter
 from dataclasses import dataclass, field
 
 import groq
@@ -89,9 +14,7 @@ import groq
 # Configuration
 # ---------------------------------------------------------------------------
 
-# The model used for both roles (rewriter and judge). Override with --model.
-# Groq hosts several open models; gpt-oss-120b is a strong general default
-# for instruction-following / structured JSON output like this script needs.
+# The model used for both roles (rewriter and judge).
 DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 # How many independent times to ask the judge about the SAME draft, each
@@ -217,16 +140,30 @@ class Rewriter:
         self._client = client
         self._model = model
 
-    def _call(self, user: str) -> str:
-        response = self._client.chat.completions.create(
-            model=self._model,
-            max_completion_tokens=1024,
-            messages=[
-                {"role": "system", "content": REWRITER_SYSTEM_PROMPT},
-                {"role": "user", "content": user},
-            ],
-        )
-        return (response.choices[0].message.content or "").strip()
+    def _call(self, user: str, retries: int = 2) -> str:
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._model,
+                    max_completion_tokens=1024,
+                    messages=[
+                        {"role": "system", "content": REWRITER_SYSTEM_PROMPT},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                text = (response.choices[0].message.content or "").strip()
+                if text:
+                    return text
+                # The provider returned no content for this call (e.g. cut
+                # off, or an empty completion). Retry rather than silently
+                # handing back an empty draft that's a guaranteed judge fail.
+                last_error = RuntimeError(
+                    f"Rewriter returned no content (finish_reason={response.choices[0].finish_reason!r})"
+                )
+            except Exception as exc:
+                last_error = exc
+        raise last_error
 
     def write_first_draft(self, original_text: str) -> str:
         return self._call(REWRITER_INITIAL_TEMPLATE.format(original_text=original_text))
@@ -253,10 +190,6 @@ class Judge:
         response = self._client.chat.completions.create(
             model=self._model,
             max_completion_tokens=512,
-            # Ask Groq to constrain the reply to valid JSON. This is the same
-            # "standardize the output format" reliability technique the
-            # paper describes (Section 3.1.2) -- the parser below still
-            # keeps its fallback strategies in case a model doesn't honor it.
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
@@ -324,16 +257,21 @@ def judge_round(judge: Judge, original_text: str, draft_text: str, round_number:
       approved = (strict majority said clear) AND (strict majority said faithful)
       combined_feedback = feedback text from one of the calls that voted "not ready"
                           (or empty, if approved)
-
-    This is the actual decision logic of the whole program -- plain
-    Python control flow, not a call into an agent framework.
     """
     result = RoundResult(round_number=round_number, draft_text=draft_text)
     majority_threshold = n_samples // 2 + 1
 
     for sample_index in range(n_samples):
-        raw_output = judge.call(original_text, draft_text)
-        clear, faithful, feedback = parse_judge_output(raw_output)
+        try:
+            raw_output = judge.call(original_text, draft_text)
+            clear, faithful, feedback = parse_judge_output(raw_output)
+        except Exception as exc:
+            # A single failed call (network error, or the provider rejecting
+            # its own malformed JSON generation) shouldn't crash the whole
+            # round -- treat it the same as a reply we couldn't parse, so
+            # the other samples still get a chance to form a majority.
+            raw_output = f"<call failed: {exc}>"
+            clear, faithful, feedback = None, None, None
 
         result.votes.append(
             JudgeVote(sample_index=sample_index, raw_output=raw_output, clear=clear, faithful=faithful, feedback=feedback)
@@ -394,19 +332,8 @@ def refine_until_approved(
     """
     The main agentic loop: write a draft, judge it, and if it's not
     approved, feed the judge's feedback into another rewrite -- up to
-    max_rounds times.
-
-        draft = rewriter.write_first_draft(original_text)
-        for round in range(max_rounds):
-            verdict = judge_round(draft)        # majority vote, see above
-            if verdict.approved:
-                return draft as final answer
-            draft = rewriter.revise(original_text, draft, verdict.feedback)
-        return the last draft produced, marked as not approved
-
-    This is the whole point of the assignment made concrete: the judge is
-    not a one-shot grader here, it is the stopping condition that decides
-    whether the loop keeps going.
+    max_rounds times. The judge is not a one-shot grader here, it is the
+    stopping condition that decides whether the loop keeps going.
     """
     run = RefinementRun(original_text=original_text)
 
@@ -445,7 +372,17 @@ def refine_until_approved(
                 print(f"  feedback for next round: {result.combined_feedback}")
             if callback:
                 callback({"type": "status", "message": f"Drafting revision {round_number+1} based on feedback..."})
-            draft = rewriter.revise(original_text, draft, result.combined_feedback)
+            try:
+                draft = rewriter.revise(original_text, draft, result.combined_feedback)
+            except Exception as exc:
+                # The rewriter failed even after its own retries. Keep the
+                # previous draft rather than losing it to an empty/failed
+                # revision -- the next round's judge call will just see the
+                # same text again instead of a guaranteed-fail blank draft.
+                if verbose:
+                    print(f"  revision failed, keeping previous draft: {exc}")
+                if callback:
+                    callback({"type": "status", "message": f"Revision failed ({exc}); retrying with previous draft."})
 
     # Ran out of rounds without approval -- return the last draft produced,
     # clearly marked as not approved rather than silently pretending success.
@@ -454,119 +391,3 @@ def refine_until_approved(
     if callback:
         callback({"type": "final", "approved": False, "text": draft})
     return run
-
-
-# ---------------------------------------------------------------------------
-# The applied task: real insurance-policy paragraphs to simplify
-# ---------------------------------------------------------------------------
-
-
-def build_examples() -> list[str]:
-    """A few real-style dense insurance-policy paragraphs, covering
-    different kinds of jargon: exclusions, conditional coverage, and
-    procedural/time-limit language."""
-    return [
-        (
-            "Notwithstanding any other provision of this Policy, the Company shall not be liable "
-            "for any loss or damage occurring subsequent to the Insured's failure to notify the "
-            "Company in writing within thirty (30) days of the occurrence giving rise to such loss, "
-            "and any claim submitted beyond such period shall be deemed forfeited absent a showing "
-            "of good cause acceptable to the Company in its sole discretion."
-        ),
-        (
-            "Coverage under Section 4(b) is contingent upon the Insured maintaining the subject "
-            "premises in a condition free of any pre-existing defect known or reasonably "
-            "discoverable by the Insured prior to the inception of this Policy, and the Company "
-            "reserves the right to deny indemnification for any claim arising, in whole or in part, "
-            "from such a pre-existing defect, irrespective of whether said defect was the proximate "
-            "cause of the loss."
-        ),
-        (
-            "The aggregate limit of liability for all claims arising out of a single occurrence "
-            "shall not exceed the lesser of (i) the Limit of Insurance stated in the Declarations, "
-            "or (ii) the actual cash value of the covered property at the time of loss, less the "
-            "applicable deductible set forth in Item 4 of the Declarations, and in no event shall "
-            "the Company be obligated to pay any amount in excess of said limit regardless of the "
-            "number of claimants or causes of action asserted."
-        ),
-    ]
-
-
-def run_all_examples(rewriter: Rewriter, judge: Judge, examples: list[str], max_rounds: int, n_judge_samples: int) -> list[RefinementRun]:
-    runs = []
-    for i, text in enumerate(examples, start=1):
-        print(f"\n{'#' * 60}\n# EXAMPLE {i}/{len(examples)}\n{'#' * 60}")
-        print(f"Original:\n{text}\n")
-        run = refine_until_approved(rewriter, judge, text, max_rounds=max_rounds, n_judge_samples=n_judge_samples)
-        print(f"\n{'=' * 60}")
-        status = "APPROVED" if run.approved else f"NOT approved after {max_rounds} rounds (showing best attempt)"
-        print(f"RESULT ({status}), {len(run.rounds)} round(s) used:")
-        print(run.final_text)
-        print("=" * 60)
-        runs.append(run)
-    return runs
-
-
-def summarize(runs: list[RefinementRun]) -> None:
-    total = len(runs)
-    approved = sum(1 for r in runs if r.approved)
-    total_rounds = sum(len(r.rounds) for r in runs)
-    total_judge_calls = sum(len(round_.votes) for r in runs for round_ in r.rounds)
-
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"Approved:                {approved}/{total}")
-    print(f"Average rounds per item: {total_rounds / total:.1f}")
-    print(f"Total judge calls made:  {total_judge_calls}")
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="LLM-as-a-Judge applied to iteratively simplifying insurance policy text."
-    )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model used for both roles (default: {DEFAULT_MODEL})")
-    parser.add_argument("--max-rounds", type=int, default=MAX_ROUNDS, help=f"Max refine/judge rounds per paragraph (default: {MAX_ROUNDS})")
-    parser.add_argument(
-        "--n-judge-samples",
-        type=int,
-        default=N_JUDGE_SAMPLES,
-        help=f"How many times to ask the judge per round, for majority voting (default: {N_JUDGE_SAMPLES})",
-    )
-    parser.add_argument(
-        "--text",
-        default=None,
-        help="Simplify this exact paragraph instead of running the three built-in examples.",
-    )
-    args = parser.parse_args()
-
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        print(
-            "ERROR: GROQ_API_KEY is not set. Export your Groq API key, e.g.\n"
-            "    export GROQ_API_KEY=gsk_...\n"
-            "Get one at https://console.groq.com/keys\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    client = groq.Groq(api_key=api_key)
-    rewriter = Rewriter(client, model=args.model)
-    judge = Judge(client, model=args.model)
-
-    start = time.time()
-    if args.text:
-        runs = run_all_examples(rewriter, judge, [args.text], args.max_rounds, args.n_judge_samples)
-    else:
-        runs = run_all_examples(rewriter, judge, build_examples(), args.max_rounds, args.n_judge_samples)
-    summarize(runs)
-    print(f"\n(total time: {time.time() - start:.1f}s)")
-
-
-if __name__ == "__main__":
-    main()

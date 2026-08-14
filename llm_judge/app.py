@@ -2,9 +2,12 @@ import os
 import json
 import threading
 import queue
+from dotenv import load_dotenv
 from flask import Flask, render_template, request, Response, jsonify
 from llm_as_a_judge import Rewriter, Judge, refine_until_approved, DEFAULT_MODEL
 import groq
+
+load_dotenv()
 
 app = Flask(__name__)
 
